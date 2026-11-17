@@ -1,0 +1,422 @@
+addpath(genpath('flypath3d_v3'))
+addpath(genpath('pathplotter and waypoints'))
+
+clear WP_selector
+clear ILOS_guidance
+clear guidance
+clc; clear; close all;
+
+%% Simulation Parameters
+T_final   = 6500;
+h         = 0.1;
+psi_ref   = 10 * pi/180;
+U_ref     = 9;
+
+Vc        = 1;
+beta_Vc   = deg2rad(45);
+Vw        = 10;
+beta_Vw   = deg2rad(135);
+rho_a     = 1.247;
+cy        = 0.95;
+cn        = 0.15;
+L_oa      = 161;
+A_Lw      = 10 * L_oa;
+t_wind    = 200;
+delta_max = 40 * pi/180;
+
+current_on        = true;
+crab_compensation = true;
+feedback          = 'kf';
+
+%% Initial States & Controller Gains
+eta_0   = [0 0 -110*pi/180]';
+nu_0    = [0 0 0]';
+delta_0 = 0;
+n_0     = 0;
+Qm_0    = 0;
+x       = [nu_0' eta_0' delta_0 n_0 Qm_0]';
+
+u_design = 9;
+[T, K]   = nomoto_first_order(u_design);
+wb       = 0.005;
+zeta     = 1;
+[Kp, Kd, Ki] = pid_desing_nomoto(wb, zeta, T, K);
+Ki       = 0;
+
+xd        = [eta_0(3); 0; 0];
+e_int     = 0;
+sigma_psi = deg2rad(0.5);
+sigma_r   = deg2rad(0.1);
+
+% * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+% Problem 6b: Inertial ESKF Initialization (Tuned Noise Weights)
+mu    = deg2rad(63.43);           % Latitude [rad]
+g     = gravity(mu);              % Gravity acceleration [m/s^2]
+T_acc = 1000;                     % Accelerometer bias time constant [s]
+T_ars = 500;                      % Gyroscope bias time constant [s]
+
+% Sensor noise standard deviations
+sigma_accel       = 0.001;        % [m/s^2]
+sigma_gyro        = 0.0000175;    % [rad/s]
+sigma_gps_pos     = 0.025;        % [m]
+sigma_compass_psi = deg2rad(0.5); % [rad]
+
+% Constant IMU biases
+b_acc = [0.01; -0.01; 0];         % Accelerometer bias [m/s^2]
+b_ars = [0; 0; deg2rad(0.02)];    % Gyroscope bias [rad/s]
+
+% ESKF state vector (15x1)
+x_ins = [eta_0(1); eta_0(2); 0; zeros(3,1); zeros(3,1); 0; 0; eta_0(3); zeros(3,1)];
+
+% Covariance and tuned noise matrices aligned with true sensor specs
+P_prd = eye(15);
+Rd    = diag([sigma_gps_pos^2*[1 1 1], sigma_accel^2*[1 1 1], sigma_compass_psi^2]);
+Qd    = diag([sigma_accel^2*[1 1 1], ...
+              1e-9*[1 1 1], ...
+              sigma_gyro^2*[1 1 1], ...
+              1e-9*[1 1 1]]);
+% Qd  = diag([sigma_accel^2*[1 1 1], 1e-8*[1 1 1], sigma_gyro^2*[1 1 1], 1e-8*[1 1 1]]);
+
+h_pos     = 0.2;
+t_slow    = 0;
+u_init    = [delta_0; open_loop_speed_control(U_ref)];
+nu_c_init = current_on * [Vc * cos(beta_Vc - eta_0(3)); Vc * sin(beta_Vc - eta_0(3)); 0];
+xdot      = ship(x, u_init, nu_c_init, [0; 0; 0]);
+% *************************************************************************
+
+%% Main Simulation Loop
+t          = 0:h:T_final;
+nTimeSteps = length(t);
+simdata    = zeros(nTimeSteps, 24);
+
+for i = 1:nTimeSteps
+
+    psi_meas = ssa(x(6) + sigma_compass_psi*randn);
+    r_meas   = x(3) + sigma_r*randn;
+
+    % * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+    % Problem 6b: Prior Consistency Metrics & Multi-Rate ESKF Update
+    y_psi = psi_meas;
+    y_pos = [x(4); x(5); 0] + sigma_gps_pos * randn(3,1);
+
+    f_true   = [xdot(1) - x(3)*x(2); xdot(2) + x(3)*x(1); -g];
+    f_imu    = f_true + b_acc + sigma_accel * randn(3,1);
+    w_imu    = [0; 0; x(3)] + b_ars + sigma_gyro * randn(3,1);
+    imu_meas = [f_imu; w_imu];
+
+    % Compute NIS and NEES using prior state and covariance BEFORE update
+    innov = ssa(y_psi - x_ins(12));
+    S     = P_prd(12,12) + Rd(7,7);
+    NIS   = innov^2 / S;
+
+    e_psi = ssa(x_ins(12) - x(6));
+    e_bg  = x_ins(15) - b_ars(3);
+
+    e_est = [e_psi; e_bg];
+    Pblk  = P_prd([12 15], [12 15]);
+
+    % Joint NEES
+    NEES = e_est' / Pblk * e_est;
+
+    % Individual diagnostic contributions
+    NEES_psi = e_psi^2 / Pblk(1,1);
+    NEES_bg  = e_bg^2 / Pblk(2,2);
+
+    % Multi-rate filter update
+    if t(i) >= t_slow - 1e-9
+        [x_ins, P_prd] = ins_euler(x_ins, P_prd, mu, h, Qd, Rd, T_acc, T_ars, imu_meas, y_psi, y_pos);
+        t_slow = t_slow + h_pos;
+    else
+        [x_ins, P_prd] = ins_euler(x_ins, P_prd, mu, h, Qd, Rd, T_acc, T_ars, imu_meas, y_psi);
+    end
+
+    psi_hat_step = ssa(x_ins(12));
+    r_hat_step   = w_imu(3) - x_ins(15);
+    b_hat_step   = x_ins(15);
+    x_pst        = [psi_hat_step; r_hat_step; b_hat_step];
+    % *************************************************************************
+
+    switch feedback
+        case 'true',  psi_fb = x(6);      r_fb = x(3);
+        case 'noisy', psi_fb = psi_meas;  r_fb = r_meas;
+        case 'kf',    psi_fb = x_pst(1);  r_fb = x_pst(2);
+    end
+
+    if current_on
+        uc = Vc * cos(beta_Vc - x(6));
+        vc = Vc * sin(beta_Vc - x(6));
+    else 
+        uc = 0;
+        vc = 0;
+    end
+    nu_c = [ uc vc 0 ]';
+
+    [chi_d, last, e_y] = guidance(x(4), x(5), h);
+
+    if crab_compensation
+        U = sqrt(x(1)^2 + x(2)^2);
+        if U > 1
+            beta_c = atan2(x(2), x(1));
+        else
+            beta_c = 0;
+        end
+        psi_ref = ssa(chi_d - beta_c);
+    else
+        psi_ref = chi_d;
+    end
+
+    if t(i) > t_wind
+        u_w      = Vw * cos(beta_Vw - x(6));
+        v_w      = Vw * sin(beta_Vw - x(6));
+        u_rw     = x(1) - u_w;
+        v_rw     = x(2) - v_w;
+        V_rw     = sqrt(u_rw^2 + v_rw^2);
+        gamma_rw = -atan2(v_rw, u_rw);
+        q        = 0.5 * rho_a * V_rw^2;
+        Ywind    = q * cy * sin(gamma_rw)   * A_Lw;
+        Nwind    = q * cn * sin(2*gamma_rw) * A_Lw * L_oa;
+    else
+        Ywind = 0;
+        Nwind = 0;
+    end
+    tau_wind = [0 Ywind Nwind]';
+
+    xd_dot = ref_model(xd, psi_ref);
+    psi_d  = xd(1);
+    r_d    = xd(2);
+    u_d    = U_ref;
+
+    e_psi   = ssa(psi_fb - psi_d);
+    e_r     = r_fb - r_d;
+    delta_c = PID_heading(e_psi, e_r, e_int, Kp, Kd, Ki);
+
+    saturation = abs(delta_c) > delta_max;
+    if ~saturation
+        e_int = e_int + h*e_psi;
+    end 
+
+    n_c = open_loop_speed_control(U_ref);
+
+    u = [delta_c n_c]';
+    [xdot, tau_total] = ship(x, u, nu_c, tau_wind);
+
+    simdata(i,:) = [x(1:3)' x(4:6)' x(7) x(8) u(1) u(2) u_d psi_d r_d uc vc e_y chi_d ...
+                    psi_meas r_meas x_pst' NIS NEES];
+
+    x  = rk4(@ship, h, x, u, nu_c, tau_wind);
+    xd = xd + h*xd_dot;
+
+    if mod(i, floor(nTimeSteps / 10)) == 0
+        progress = (i/nTimeSteps) * 100;
+        fprintf('  %d%% complete\n', round(progress));
+    elseif i == 1
+        disp("  Simulation in progress:")
+        fprintf('  %d%% complete\n', 0);
+    end
+end
+
+simdata = simdata(1:i,:);
+t       = t(1:i);
+
+% * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+% Save simdata to simdata_ESKF.mat (Problem 6b requirement)
+save('simdata_ESKF.mat', 'simdata');
+% *************************************************************************
+
+%% Extract Simulation Data
+u           = simdata(:,1);
+v           = simdata(:,2);
+r           = simdata(:,3);
+r_deg       = (180/pi) * r;
+x           = simdata(:,4);
+y           = simdata(:,5);
+psi         = simdata(:,6);
+psi_deg     = (180/pi) * psi;
+delta_deg   = (180/pi) * simdata(:,7);
+n           = (30/pi) * simdata(:,8);
+delta_c_deg = (180/pi) * simdata(:,9);
+n_c         = (30/pi) * simdata(:,10);
+u_d         = simdata(:,11);
+psi_d       = simdata(:,12);
+psi_d_deg   = (180/pi) * psi_d;
+r_d         = simdata(:,13);
+r_d_deg     = (180/pi) * r_d;
+uc          = simdata(:,14);
+vc          = simdata(:,15);
+e_y         = simdata(:,16);
+chi_d       = (180/pi) * simdata(:,17);
+psi_meas    = simdata(:,18);   r_meas = simdata(:,19);
+psi_hat     = simdata(:,20);   r_hat  = simdata(:,21);   b_hat = simdata(:,22);
+NIS_log     = simdata(:,23);
+NEES_log    = simdata(:,24);
+
+u_r = u - uc;
+v_r = v - vc;
+
+%% Consistency Analysis (NIS & NEES)
+idx   = t > 100;
+tt    = t(idx);
+nis   = NIS_log(idx);
+nees  = NEES_log(idx);
+alpha = [0.025 0.975];
+
+if exist('chi2inv','file')
+    B_NIS  = chi2inv(alpha, 1);
+    B_NEES = chi2inv(alpha, 2);
+else
+    B_NIS  = [0.00098 5.024];
+    B_NEES = [0.0506  7.378];
+end
+
+ANIS    = mean(nis);
+ANEES   = mean(nees);
+in_NIS  = 100*mean(nis  >= B_NIS(1)  & nis  <= B_NIS(2));
+in_NEES = 100*mean(nees >= B_NEES(1) & nees <= B_NEES(2));
+
+fprintf('ANIS  = %.3f (ideal 1), %.1f%% of samples inside 95%% bounds\n', ANIS,  in_NIS);
+fprintf('ANEES = %.3f (ideal 2), %.1f%% of samples inside 95%% bounds\n', ANEES, in_NEES);
+
+%% Plotting
+figure(10); clf
+subplot(211); hold on; grid on
+plot(tt, nis, '.', 'Color', [0.6 0.6 0.6], 'MarkerSize', 3);
+yline(B_NIS(2), 'r--', 'linewidth', 1.5);
+yline(B_NIS(1), 'r--', 'linewidth', 1.5);
+yline(ANIS,     'b-',  'linewidth', 2);
+set(gca, 'YScale', 'log'); ylim([1e-4 50])
+title(sprintf('NIS: average %.2f (ideal 1), %.1f%% inside 95%% bounds', ANIS, in_NIS));
+xlabel('Time (s)'); ylabel('NIS');
+legend('NIS', '97.5% bound', '2.5% bound', 'average', 'Location', 'eastoutside')
+
+subplot(212); hold on; grid on
+plot(tt, nees, '.', 'Color', [0.6 0.6 0.6], 'MarkerSize', 3);
+yline(B_NEES(2), 'r--', 'linewidth', 1.5);
+yline(B_NEES(1), 'r--', 'linewidth', 1.5);
+yline(ANEES,     'b-',  'linewidth', 2);
+set(gca, 'YScale', 'log'); ylim([1e-3 100])
+title(sprintf('NEES: average %.2f (ideal 2), %.1f%% inside 95%% bounds', ANEES, in_NEES));
+xlabel('Time (s)'); ylabel('NEES');
+legend('NEES', '97.5% bound', '2.5% bound', 'average', 'Location', 'eastoutside')
+
+psi_true_deg = rad2deg(ssa(psi));
+psi_meas_deg = rad2deg(psi_meas);
+psi_hat_deg  = rad2deg(psi_hat);
+r_meas_deg   = rad2deg(r_meas);
+r_hat_deg    = rad2deg(r_hat);
+
+figure(6); clf
+subplot(211)
+plot(t, psi_meas_deg, t, psi_true_deg, 'linewidth', 1.5); grid on
+title('Yaw angle: measurement vs true'); xlabel('Time (s)'); ylabel('Angle (deg)');
+legend('measured \psi', 'true \psi')
+subplot(212)
+plot(t, r_meas_deg, t, r_deg, 'linewidth', 1.5); grid on
+title('Yaw rate: measurement vs true'); xlabel('Time (s)'); ylabel('Rate (deg/s)');
+legend('measured r', 'true r')
+
+figure(7); clf
+subplot(311)
+plot(t, psi_true_deg, t, psi_hat_deg, '--', 'linewidth', 1.5); grid on
+title('Yaw angle: estimate vs true'); xlabel('Time (s)'); ylabel('Angle (deg)');
+legend('true \psi', 'estimated \psi')
+subplot(312)
+plot(t, r_deg, t, r_hat_deg, '--', 'linewidth', 1.5); grid on
+title('Yaw rate: estimate vs true'); xlabel('Time (s)'); ylabel('Rate (deg/s)');
+legend('true r', 'estimated r')
+subplot(313)
+plot(t, rad2deg(b_hat), 'linewidth', 1.5); grid on
+title('Estimated gyro bias'); xlabel('Time (s)'); ylabel('Rate (deg/s)');
+legend('estimated b_{ars,z}')
+
+idx = t > 50;
+figure(8); clf
+subplot(211)
+plot(t(idx), rad2deg(ssa(psi_hat(idx) - psi(idx))), 'linewidth', 1.2); grid on
+title('Yaw angle estimation error'); xlabel('Time (s)'); ylabel('\psi_{hat} - \psi (deg)');
+subplot(212)
+plot(t(idx), r_hat_deg(idx) - r_deg(idx), 'linewidth', 1.2); grid on
+title('Yaw rate estimation error'); xlabel('Time (s)'); ylabel('r_{hat} - r (deg/s)');
+
+figure(9); clf
+sgtitle(['Feedback: ' feedback])
+subplot(221)
+plot(y, x, 'linewidth', 1.5); axis equal; grid on
+title('North-East position'); xlabel('East (m)'); ylabel('North (m)');
+subplot(222)
+plot(t, delta_c_deg, 'linewidth', 1.2); grid on
+ylim([-1.2 1.2]*rad2deg(delta_max))
+title('Desired rudder angle'); xlabel('Time (s)'); ylabel('\delta_c (deg)');
+subplot(223)
+plot(t, psi_true_deg, t, psi_d_deg, '--', 'linewidth', 1.5); grid on
+title('Yaw angle'); xlabel('Time (s)'); ylabel('Angle (deg)');
+legend('\psi', '\psi_d')
+subplot(224)
+plot(t, r_deg, t, r_d_deg, '--', 'linewidth', 1.5); grid on
+title('Yaw rate'); xlabel('Time (s)'); ylabel('Rate (deg/s)');
+legend('r', 'r_d')
+
+beta_crab = atan2(v, u);
+beta_slip = atan2(v_r, u_r);
+chi       = rad2deg(ssa(psi + beta_crab));
+
+figure(4)
+figure(gcf)
+subplot(211)
+plot(t, rad2deg(beta_slip), t, rad2deg(beta_crab), 'linewidth', 2);
+title('Sideslip and crab angle'); xlabel('Time (s)'); ylabel('Angle (deg)');
+legend('sideslip \beta', 'crab \beta_c')
+subplot(212)
+plot(t, e_y, 'linewidth', 2);
+title('Cross track error'); xlabel('Time (s)'); ylabel('Error (m)');
+legend('cross track error')
+
+figure(5)
+figure(gcf)
+subplot(212)
+plot(t, chi_d, t, chi, 'linewidth', 2);
+title('Course desired and course'); xlabel('Time (s)'); ylabel('Angle (deg)');
+legend('course desired \chi_d', 'course \chi')
+subplot(211)
+plot(t, rad2deg(ssa(deg2rad(chi_d - chi))), 'linewidth', 2);
+title("Course error"); xlabel('Time (s)'); ylabel('Angle (deg)');
+legend('course error \e')
+
+figure(3)
+figure(gcf)
+subplot(311)
+plot(y, x, 'linewidth', 2); axis('equal')
+title('North-East positions'); xlabel('(m)'); ylabel('(m)'); 
+subplot(312)
+plot(t, psi_deg, t, psi_d_deg, 'linewidth', 2);
+title('Actual and desired yaw angle'); xlabel('Time (s)'); ylabel('Angle (deg)'); 
+legend('actual yaw','desired yaw')
+subplot(313)
+plot(t, r_deg, t, r_d_deg, 'linewidth', 2);
+title('Actual and desired yaw rates'); xlabel('Time (s)'); ylabel('Angle rate (deg/s)'); 
+legend('actual yaw rate','desired yaw rate')
+
+figure(2)
+figure(gcf)
+subplot(311)
+plot(t, u, t, u_d, 'linewidth', 2);
+title('Actual and desired surge velocity'); xlabel('Time (s)'); ylabel('Velocity (m/s)');
+legend('actual surge','desired surge')
+subplot(312)
+plot(t, n, t, n_c, 'linewidth', 2);
+title('Actual and commanded propeller speed'); xlabel('Time (s)'); ylabel('Motor speed (RPM)');
+legend('actual RPM','commanded RPM')
+subplot(313)
+plot(t, delta_deg, t, delta_c_deg, 'linewidth', 2);
+title('Actual and commanded rudder angle'); xlabel('Time (s)'); ylabel('Angle (deg)');
+legend('actual rudder angle','commanded rudder angle')
+
+z     = zeros(length(x),1);
+phi   = zeros(length(psi),1);
+theta = zeros(length(psi),1);
+
+new_object('flypath3d_v3/ship1.mat',[x,y,z,phi,theta,psi],...
+    'model','royalNavy2.mat','scale',(max(max(abs(x)),max(abs(y)))/1000),...
+    'edge',[0 0 0],'face',[0 0 0],'alpha',1,...
+    'path','on','pathcolor',[.89 .0 .27],'pathwidth',2);
+
+pathplotter(x,y);
